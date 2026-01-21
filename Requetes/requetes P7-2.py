@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 from pymongo import MongoClient
 import polars as pl
 
@@ -12,6 +13,9 @@ COLL_NAME = "listings"
 
 OUTDIR = os.getenv("OUTDIR", "outputs")
 TOP_N = int(os.getenv("TOP_N", "5"))
+
+# Si = "1", on supprime les CSV existants avant de réexporter
+NETTOYER_OUTPUTS = os.getenv("NETTOYER_OUTPUTS", "0") == "1"
 
 # Connexion Mongo : on prend en priorité MONGO_URI.
 # Sinon on construit l’URI à partir de MONGO_USER / MONGO_PASS.
@@ -34,7 +38,7 @@ PROJECTION = {
 
 
 def die(msg: str, code: int = 1):
-    print(f"[ERROR] {msg}", file=sys.stderr)
+    print(f"[ERREUR] {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -58,10 +62,27 @@ def build_mongo_uri() -> str:
     return f"mongodb://{MONGO_USER}:{MONGO_PASS}@{MONGO_HOST}:{MONGO_PORT}/?authSource={MONGO_AUTH_SOURCE}"
 
 
+def nettoyer_outputs(outdir: str):
+    """Supprime les anciens CSV dans le dossier de sortie."""
+    p = Path(outdir)
+    if not p.exists():
+        return
+    for f in p.glob("*.csv"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
 
+    # Optionnel : nettoyage avant export (pratique quand on relance souvent)
+    if NETTOYER_OUTPUTS:
+        nettoyer_outputs(OUTDIR)
+
     uri = build_mongo_uri()
+
     # Connexion
     try:
         client = MongoClient(uri, serverSelectionTimeoutMS=5000)
@@ -70,7 +91,7 @@ def main():
         die(f"Connexion MongoDB impossible (ping KO). Détail: {e}")
 
     coll = client[DB_NAME][COLL_NAME]
-    print(f"[INFO] Mongo OK | db={DB_NAME} coll={COLL_NAME}")
+    print(f"[INFO] Mongo OK | base={DB_NAME} collection={COLL_NAME}")
 
     # Extraction
     docs = list(coll.find({}, PROJECTION))
@@ -91,62 +112,76 @@ def main():
 
     # KPI réservation (proxy) : (30 - dispo_30)/30
     df = df.with_columns([
-        ((pl.lit(30) - pl.col("availability_30")) / pl.lit(30)).alias("booking_rate_30d"),
-        pl.col("last_scraped").dt.strftime("%Y-%m").alias("month"),
+        ((pl.lit(30) - pl.col("availability_30")) / pl.lit(30)).alias("taux_reservation_30j"),
+        pl.col("last_scraped").dt.strftime("%Y-%m").alias("mois"),
     ])
+
+    # Optionnel : traduction des types de logement (tu peux commenter ce bloc)
+    df = df.with_columns(
+        pl.when(pl.col("room_type") == "Entire home/apt").then(pl.lit("Logement entier"))
+        .when(pl.col("room_type") == "Private room").then(pl.lit("Chambre privée"))
+        .when(pl.col("room_type") == "Shared room").then(pl.lit("Chambre partagée"))
+        .when(pl.col("room_type") == "Hotel room").then(pl.lit("Chambre d’hôtel"))
+        .otherwise(pl.col("room_type"))
+        .alias("type_logement")
+    ).drop("room_type")
 
     # 1) Taux de réservation moyen par mois et par type de logement
     t1 = (
-        df.group_by(["month", "room_type"])
-          .agg(pl.col("booking_rate_30d").mean().alias("avg_booking_rate"))
-          .sort(["month", "room_type"])
+        df.group_by(["mois", "type_logement"])
+          .agg(pl.col("taux_reservation_30j").mean().alias("taux_reservation_moyen"))
+          .sort(["mois", "type_logement"])
     )
-    t1.write_csv(os.path.join(OUTDIR, "01_booking_rate_by_month_room_type.csv"))
+    t1.write_csv(os.path.join(OUTDIR, "01_taux_reservation_moyen_par_mois_et_type_logement.csv"))
 
     # 2) Médiane du nombre d’avis (tous logements)
-    df.select(pl.col("number_of_reviews").median().alias("median_reviews_all")) \
-      .write_csv(os.path.join(OUTDIR, "02_median_reviews_all.csv"))
+    (
+        df.select(pl.col("number_of_reviews").median().alias("mediane_nombre_avis"))
+          .write_csv(os.path.join(OUTDIR, "02_mediane_nombre_avis_tous_logements.csv"))
+    )
 
     # 3) Médiane du nombre d’avis par catégorie d’hôte (superhost vs non)
     t3 = (
         df.with_columns(
             pl.when(pl.col("host_is_superhost") == "t")
-              .then(pl.lit("superhost"))
-              .otherwise(pl.lit("non_superhost"))
-              .alias("host_category")
+              .then(pl.lit("Superhôte"))
+              .otherwise(pl.lit("Non superhôte"))
+              .alias("categorie_hote")
         )
-        .group_by("host_category")
-        .agg(pl.col("number_of_reviews").median().alias("median_reviews"))
-        .sort("host_category")
+        .group_by("categorie_hote")
+        .agg(pl.col("number_of_reviews").median().alias("mediane_nombre_avis"))
+        .sort("categorie_hote")
     )
-    t3.write_csv(os.path.join(OUTDIR, "03_median_reviews_by_host_category.csv"))
+    t3.write_csv(os.path.join(OUTDIR, "03_mediane_nombre_avis_par_categorie_hote.csv"))
 
     # 4) Densité de logements par quartier (volume d'annonces)
     t4 = (
         df.group_by("neighbourhood_cleansed")
-          .agg(pl.len().alias("listings_count"))
-          .sort("listings_count", descending=True)
-          .rename({"neighbourhood_cleansed": "neighbourhood"})
+          .agg(pl.len().alias("nombre_annonces"))
+          .sort("nombre_annonces", descending=True)
+          .rename({"neighbourhood_cleansed": "quartier"})
     )
-    t4.write_csv(os.path.join(OUTDIR, "04_listings_density_by_neighbourhood.csv"))
+    t4.write_csv(os.path.join(OUTDIR, "04_densite_logements_par_quartier.csv"))
 
     # 5) Quartiers avec le plus fort taux de réservation par mois (top N)
     t5 = (
-        df.group_by(["month", "neighbourhood_cleansed"])
-          .agg(pl.col("booking_rate_30d").mean().alias("avg_booking_rate"))
+        df.group_by(["mois", "neighbourhood_cleansed"])
+          .agg(pl.col("taux_reservation_30j").mean().alias("taux_reservation_moyen"))
           .with_columns(
-              pl.col("avg_booking_rate")
+              pl.col("taux_reservation_moyen")
                 .rank(method="dense", descending=True)
-                .over("month")
-                .alias("rank")
+                .over("mois")
+                .alias("rang")
           )
-          .filter(pl.col("rank") <= TOP_N)
-          .sort(["month", "rank"])
-          .rename({"neighbourhood_cleansed": "neighbourhood"})
+          .filter(pl.col("rang") <= TOP_N)
+          .sort(["mois", "rang"])
+          .rename({"neighbourhood_cleansed": "quartier"})
     )
-    t5.write_csv(os.path.join(OUTDIR, "05_top_neighbourhoods_by_booking_rate_per_month.csv"))
+    t5.write_csv(os.path.join(OUTDIR, "05_top_quartiers_taux_reservation_par_mois.csv"))
 
-    print(f"[OK] Exports générés dans: {OUTDIR}")
+    print(f"[OK] Exports générés dans : {OUTDIR}")
+    if NETTOYER_OUTPUTS:
+        print("[INFO] Nettoyage préalable : anciens CSV supprimés.")
 
 
 if __name__ == "__main__":
