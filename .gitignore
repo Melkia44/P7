@@ -1,8 +1,14 @@
+# Environnements locaux
 .venv/
 __pycache__/
-outputs/
 .env
-.venv/
-# data
-data/
-*.csv
+
+# Outputs générés
+outputs/
+
+# OS / IDE
+.DS_Store
+.vscode/
+
+# Logs
+*.log
