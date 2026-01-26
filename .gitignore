@@ -12,3 +12,6 @@ outputs/
 
 # Logs
 *.log
+
+Data/*.csv
+Data/**/*.csv
