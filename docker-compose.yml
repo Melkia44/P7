@@ -1,0 +1,11 @@
+services:
+  pipeline:
+    build: ./Docker/Pipeline
+    container_name: p7_pipeline
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./Data:/app/Data:ro
+      - ./Requetes:/app/Requetes:ro
+      - ./outputs:/app/outputs
+    command: ["python", "/app/Requetes/requetes_P7_2.py"]
